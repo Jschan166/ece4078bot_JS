@@ -34,9 +34,7 @@ running = True
 left_pwm, right_pwm = 0, 0
 left_count, right_count = 0, 0
 prev_left_state, prev_right_state = None, None
-
-# INCREASED to 35: Ensures motors have enough torque to move without needing a violent 80% kick
-MIN_PWM_THRESHOLD = 35 
+MIN_PWM_THRESHOLD = 15
 current_movement, prev_movement = 'stop', 'stop'
 
 
@@ -73,16 +71,20 @@ def setup_gpio():
 def left_encoder_callback(channel):
     global left_count, prev_left_state
     current_state = GPIO.input(LEFT_ENCODER)
+    
+    # Check for actual state change. Without this, false positive happens due to electrical noise
+    # After testing, debouncing not needed
     if (prev_left_state is not None and current_state != prev_left_state):       
         left_count += 1
         prev_left_state = current_state 
     elif prev_left_state is None:
-        prev_left_state = current_state
+        prev_left_state = current_state # First reading
 
 
 def right_encoder_callback(channel):
-    global right_count, prev_right_state
+    global right_count, prev_right_state, prev_right_time
     current_state = GPIO.input(RIGHT_ENCODER)
+    
     if (prev_right_state is not None and current_state != prev_right_state): 
         right_count += 1
         prev_right_state = current_state
@@ -98,10 +100,34 @@ def reset_encoder():
 def set_motors(left, right):
     global prev_movement, current_movement
     
-    # THE MOTOR KICK BLOCK HAS BEEN COMPLETELY REMOVED HERE
-    # This stops the robot from overshooting tap-turns blindly.
+    # Pre-Start Kick (Motor Priming), to reduce initial jerk and slight orientation change when movement starts
+    if prev_movement == 'stop':
+        if current_movement  == 'forward':
+            GPIO.output(RIGHT_MOTOR_IN1, GPIO.HIGH)
+            GPIO.output(RIGHT_MOTOR_IN2, GPIO.LOW)
+            GPIO.output(LEFT_MOTOR_IN3, GPIO.HIGH)
+            GPIO.output(LEFT_MOTOR_IN4, GPIO.LOW)
+        elif current_movement == 'backward':
+            GPIO.output(RIGHT_MOTOR_IN1, GPIO.LOW)
+            GPIO.output(RIGHT_MOTOR_IN2, GPIO.HIGH)
+            GPIO.output(LEFT_MOTOR_IN3, GPIO.LOW)
+            GPIO.output(LEFT_MOTOR_IN4, GPIO.HIGH)
+        elif current_movement == 'clockwise':
+            GPIO.output(RIGHT_MOTOR_IN1, GPIO.LOW)
+            GPIO.output(RIGHT_MOTOR_IN2, GPIO.HIGH)
+            GPIO.output(LEFT_MOTOR_IN3, GPIO.HIGH)
+            GPIO.output(LEFT_MOTOR_IN4, GPIO.LOW)
+        elif current_movement == 'anticlockwise':
+            GPIO.output(RIGHT_MOTOR_IN1, GPIO.HIGH)
+            GPIO.output(RIGHT_MOTOR_IN2, GPIO.LOW)
+            GPIO.output(LEFT_MOTOR_IN3, GPIO.LOW)
+            GPIO.output(LEFT_MOTOR_IN4, GPIO.HIGH)
+        
+        left_motor_pwm.ChangeDutyCycle(80)
+        right_motor_pwm.ChangeDutyCycle(80)
+        time.sleep(0.05)
     
-    # Set the desired PWM directly
+    # Set the desired PWM
     if right > 0:
         GPIO.output(RIGHT_MOTOR_IN1, GPIO.HIGH)
         GPIO.output(RIGHT_MOTOR_IN2, GPIO.LOW)
@@ -111,6 +137,7 @@ def set_motors(left, right):
         GPIO.output(RIGHT_MOTOR_IN2, GPIO.HIGH)
         right_motor_pwm.ChangeDutyCycle(min(abs(right), 100))
     else:
+        # when pwm = 0, implement Active Braking mode, better than putting duty cycle to 0 which may cause uneven stopping
         GPIO.output(RIGHT_MOTOR_IN1, GPIO.HIGH)
         GPIO.output(RIGHT_MOTOR_IN2, GPIO.HIGH)
         right_motor_pwm.ChangeDutyCycle(100)
@@ -133,12 +160,13 @@ def apply_min_threshold(pwm_value, min_threshold):
     if pwm_value == 0:
         return 0  # Zero means stop
     elif abs(pwm_value) < min_threshold:
-        return min_threshold if pwm_value > 0 else -min_threshold 
+        return min_threshold if pwm_value > 0 else -min_threshold # Boost small values to minimum threshold, preserving direction
     else:
         return pwm_value
 
 
 def pid_control():
+    '''This function sets the motor pwm using pid control'''
     global left_pwm, right_pwm, left_count, right_count, use_PID, KP, KI, KD, prev_movement, current_movement
     
     integral = 0
@@ -164,7 +192,7 @@ def pid_control():
                 error = left_count - right_count
                 proportional = KP * error
                 integral += KI * error * dt
-                integral = max(-MAX_CORRECTION, min(integral, MAX_CORRECTION))
+                integral = max(-MAX_CORRECTION, min(integral, MAX_CORRECTION))  # Anti-windup
                 derivative = KD * (error - last_error) / dt if dt > 0 else 0
                 correction = proportional + integral + derivative
                 correction = max(-MAX_CORRECTION, min(correction, MAX_CORRECTION))
@@ -183,29 +211,32 @@ def pid_control():
                     target_left_pwm = left_pwm + correction
                     target_right_pwm = right_pwm + correction
             else:
+                # Reset when stopped
                 integral = 0
                 last_error = 0
                 reset_encoder()
                 set_motors(0,0)
-                time.sleep(0.005) 
+                time.sleep(0.005) # sleep longer when robot is not moving / idle, save battery
                 continue
             
         final_left_pwm = apply_min_threshold(target_left_pwm, MIN_PWM_THRESHOLD)
         final_right_pwm = apply_min_threshold(target_right_pwm, MIN_PWM_THRESHOLD)
         set_motors(final_left_pwm, final_right_pwm)
         
-        if target_left_pwm != 0 and args.verbose:
+        if target_left_pwm != 0 and args.verbose: # print pwm values for debugging purpose
             print(f"L/R PWM: ({target_left_pwm:.2f},{target_right_pwm:.2f}), L/R Enc: ({left_count}, {right_count})")
         
         time.sleep(0.01)
 
 
 def camera_stream_server():
+    # initialize camera
     picam2 = Picamera2()
     camera_config = picam2.create_preview_configuration(lores={"size": (480,360)})
     picam2.configure(camera_config)
     picam2.start()
     
+    # Create socket for streaming
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, CAMERA_PORT))
@@ -217,6 +248,7 @@ def camera_stream_server():
             client_socket, _ = server_socket.accept()
             print(f"Camera stream client connected")
             while running:
+                # Wait for client to request a frame ("ready" signal = 1 byte)
                 ready = client_socket.recv(1)
                 if not ready: break
                 
@@ -244,6 +276,7 @@ def camera_stream_server():
 def pid_config_server():
     global use_PID, KP, KI, KD
     
+    # Create socket for receiving PID configuration
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, PID_CONFIG_PORT))
@@ -256,13 +289,17 @@ def pid_config_server():
             print(f"PID config client connected")
             
             try:
+                # Receive PID constants (4 floats)
                 data = client_socket.recv(16)
                 if data and len(data) == 16:
                     use_PID, KP, KI, KD = struct.unpack("!ffff", data)
                     if use_PID: print(f"Updated PID constants: KP={KP}, KI={KI}, KD={KD}")
                     else: print("The robot is not using PID.")
+                    
+                    # Send acknowledgment (1 for success)
                     response = struct.pack("!i", 1)
                 else:
+                    # Send failure response
                     response = struct.pack("!i", 0)
                 
                 client_socket.sendall(response)
@@ -299,6 +336,7 @@ def wheel_server():
             
             while running:
                 try:
+                    # Receive move_mode (1 byte)
                     move_mode = client_socket.recv(1)
                     if not move_mode or len(move_mode) != 1:
                         print("Wheel client sending error")
@@ -306,56 +344,69 @@ def wheel_server():
                     move_mode = struct.unpack("!B", move_mode)[0]
                     
                     if move_mode == 0:
+                        # Receive speed data (4 byte each)
                         data = client_socket.recv(8)
                         if not data or len(data) != 8:
                             print("Wheel client sending error")
                             break
                         
+                        # Unpack speed values and convert to PWM
                         left_speed, right_speed = struct.unpack("!ff", data)
+                        print(f"Received Mode 0 with L/R speed: {left_speed:.4f}, {right_speed:.4f}")
                         left_pwm, right_pwm = left_speed*100, right_speed*100
                     
                     elif move_mode == 1:
+                        # Receive speed and duration (4 byte each)
                         data = client_socket.recv(12)
                         if not data or len(data) != 12:
                             print("Wheel client sending error")
                             break
                         
+                        # Unpack speed values and convert to PWM
                         left_speed, right_speed, duration = struct.unpack("!fff", data)
+                        print(f"Received Mode 1 with L/R speed: {left_speed:.4f}, {right_speed:.4f}, Duration: {duration:.2f}s")
                         left_pwm, right_pwm = left_speed*100, right_speed*100
                         
+                        # Monitor movement duration
                         autonomous_start_time = monotonic()
                         while running:
                             elapsed_time = monotonic() - autonomous_start_time
                             if elapsed_time >= duration:
                                 left_pwm = 0
                                 right_pwm = 0
+                                print(f"Timed movement completed after {elapsed_time:.2f}s")
                                 break
                             time.sleep(0.02)
                     
                     elif move_mode == 2:
+                        # Receive speed and encoder count (4 byte each)
                         data = client_socket.recv(16)
                         if not data or len(data) != 16:
                             print("Wheel client sending error")
                             break
                         
+                        # Unpack speed values and convert to PWM
                         left_speed, right_speed, target_left_enc, target_right_enc = struct.unpack("!ffii", data)
+                        print(f"Received Mode 2 with L/R speed: {left_speed:.4f}, {right_speed:.4f}, L/R enc: {target_left_enc}, {target_right_enc}")
                         left_pwm, right_pwm = left_speed*100, right_speed*100
                         
-                        reset_encoder()
-                        
+                        # Monitor movement duration
                         autonomous_start_time = monotonic()
                         while running:
                             elapsed_time = monotonic() - autonomous_start_time
                             if left_count >= target_left_enc and right_count >= target_right_enc:
                                 left_pwm = 0
                                 right_pwm = 0
+                                print(f"Encoder-based movement completed at L/R enc: {target_left_enc}, {target_right_enc}")
                                 break
-                            elif elapsed_time >= 8: 
+                            elif elapsed_time >= 8: # safety after 8s
                                 left_pwm = 0
                                 right_pwm = 0
+                                print(f"Encoder-based movement failed.")
                                 break
                             time.sleep(0.02)
                         
+                    # Send encoder counts back as acknowledgement for all modes
                     response = struct.pack("!ii", left_count, right_count)
                     client_socket.sendall(response)
                     
@@ -375,18 +426,23 @@ def wheel_server():
 def main():
     try:
         setup_gpio()
+        
+        # Start PID control thread
         pid_thread = threading.Thread(target=pid_control)
         pid_thread.daemon = True
         pid_thread.start()
         
+        # Start camera streaming thread
         camera_thread = threading.Thread(target=camera_stream_server)
         camera_thread.daemon = True
         camera_thread.start()
         
+        # Start PID configuration server thread
         pid_config_thread = threading.Thread(target=pid_config_server)
         pid_config_thread.daemon = True
         pid_config_thread.start()
         
+        # Start wheel server (main thread)
         wheel_server()
         
     except KeyboardInterrupt:
@@ -401,6 +457,6 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--verbose', action='store_true') # Defaults to False
     args = parser.parse_args()
     main()
