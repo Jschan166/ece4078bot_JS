@@ -124,8 +124,8 @@ def set_motors(left, right):
             GPIO.output(LEFT_MOTOR_IN4, GPIO.HIGH)
         
         # FIXED: Weakened the pre-start kick to prevent tap overshoot
-        left_motor_pwm.ChangeDutyCycle(40)
-        right_motor_pwm.ChangeDutyCycle(40)
+        left_motor_pwm.ChangeDutyCycle(60)
+        right_motor_pwm.ChangeDutyCycle(60)
         time.sleep(0.02)
     
     # Set the desired PWM
