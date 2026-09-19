@@ -123,10 +123,10 @@ def set_motors(left, right):
             GPIO.output(LEFT_MOTOR_IN3, GPIO.LOW)
             GPIO.output(LEFT_MOTOR_IN4, GPIO.HIGH)
         
-        # FIXED: Weakened the pre-start kick to prevent tap overshoot
-        left_motor_pwm.ChangeDutyCycle(60)
-        right_motor_pwm.ChangeDutyCycle(60)
-        time.sleep(0.02)
+        # RESTORED TORQUE: 80% duty cycle but reduced time to 0.04s so it breaks friction without overshooting
+        left_motor_pwm.ChangeDutyCycle(80)
+        right_motor_pwm.ChangeDutyCycle(80)
+        time.sleep(0.04)
     
     # Set the desired PWM
     if right > 0:
@@ -390,6 +390,9 @@ def wheel_server():
                         left_speed, right_speed, target_left_enc, target_right_enc = struct.unpack("!ffii", data)
                         print(f"Received Mode 2 with L/R speed: {left_speed:.4f}, {right_speed:.4f}, L/R enc: {target_left_enc}, {target_right_enc}")
                         left_pwm, right_pwm = left_speed*100, right_speed*100
+                        
+                        # CRITICAL BUG FIX: Reset encoders so residual counts don't abort the turn instantly
+                        reset_encoder()
                         
                         # Monitor movement duration
                         autonomous_start_time = monotonic()
