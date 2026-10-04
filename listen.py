@@ -99,8 +99,8 @@ def setup_gpio():
 
     # Initialize PWM
     global left_motor_pwm, right_motor_pwm
-    left_motor_pwm = GPIO.PWM(LEFT_MOTOR_ENB, 500)
-    right_motor_pwm = GPIO.PWM(RIGHT_MOTOR_ENA, 500)
+    left_motor_pwm = GPIO.PWM(LEFT_MOTOR_ENB, 1000)
+    right_motor_pwm = GPIO.PWM(RIGHT_MOTOR_ENA, 1000)
     left_motor_pwm.start(0)
     right_motor_pwm.start(0)
 
