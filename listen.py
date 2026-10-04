@@ -18,10 +18,28 @@ Changes compared with the original lab version (search for [FIX] / [NEW]):
   [FIX 3] Encoder-target moves (mode 2) cannot finish instantly on stale
           counts from the previous move.
 
-  [NEW]   Start "kick" (80% power for 0.05 s at every start) is now adjustable:
+  [FIX 4] Encoder debounce.
+          Electrical noise sometimes produced bursts of fake encoder counts
+          (e.g. +80 counts in one 10-degree turn pulse that really moved ~3).
+          Real wheel edges are >= ~10 ms apart even at full speed, so edges
+          closer than --debounce_ms (default 3 ms) are rejected as noise.
+          Rejected edges are counted and printed after every move, so you can
+          see how noisy each move was.
+              python listen.py --debounce_ms 3      (default)
+              python listen.py --debounce_ms 0      (off = old behaviour)
+
+  [NEW]   Start "kick" (80% power for 0.05 s at every start) is adjustable:
               python listen.py --kick_pwm 80 --kick_time 0.05   (default = original)
               python listen.py --kick_time 0                     (no kick)
-          If you change it, redo the turn/straight calibration.
+
+  [NEW]   Optional wheel-size compensation for the PID (--right_ratio).
+          The PID equalises raw counts, but if one wheel travels further per
+          count the robot still curves.  Set
+              --right_ratio  = LEFT_COUNTS_PER_M / RIGHT_COUNTS_PER_M
+          (from wheel_calibration_encoder.py fit) to equalise DISTANCE instead.
+          Default 1.0 = original behaviour.
+
+  If you change kick, debounce or right_ratio, redo the calibration.
 
 Everything else (protocol, ports, PID, pins) is unchanged, so the PC-side
 botconnect.py works exactly as before.
@@ -71,6 +89,14 @@ KICK_TIME = 0.05       # seconds (original: 0.05). 0 disables the kick.
 STOP_SETTLE_TIME = 0.12  # [FIX 1] wait for the brake before reporting counts
 TIMING_POLL = 0.002    # [FIX 2] 2 ms duration resolution (original: 20 ms)
 
+# [FIX 4] Encoder debounce (set from command line in __main__)
+ENC_DEBOUNCE_S = 0.003
+last_left_edge, last_right_edge = 0.0, 0.0
+left_rejected, right_rejected = 0, 0   # noise edges rejected since the last reset
+
+# [NEW] PID wheel-size compensation (set from command line in __main__)
+RIGHT_RATIO = 1.0
+
 # [FIX 1] Counter access is shared by 3 threads (encoder callbacks, PID, server)
 count_lock = threading.Lock()
 
@@ -106,40 +132,64 @@ def setup_gpio():
 
 
 def left_encoder_callback(channel):
-    global left_count, prev_left_state
+    global left_count, prev_left_state, last_left_edge, left_rejected
+    now = monotonic()
     current_state = GPIO.input(LEFT_ENCODER)
 
-    # Check for actual state change. Without this, false positive happens due to electrical noise
-    if (prev_left_state is not None and current_state != prev_left_state):
-        with count_lock:
-            left_count += 1
-        prev_left_state = current_state
-    elif prev_left_state is None:
+    if prev_left_state is None:
         prev_left_state = current_state  # First reading
+        return
+    # Check for actual state change. Without this, false positive happens due to electrical noise
+    if current_state == prev_left_state:
+        return
+    # [FIX 4] Too soon after the last real edge to be a wheel edge: noise.
+    if now - last_left_edge < ENC_DEBOUNCE_S:
+        with count_lock:
+            left_rejected += 1
+        return
+    with count_lock:
+        left_count += 1
+    prev_left_state = current_state
+    last_left_edge = now
 
 
 def right_encoder_callback(channel):
-    global right_count, prev_right_state
+    global right_count, prev_right_state, last_right_edge, right_rejected
+    now = monotonic()
     current_state = GPIO.input(RIGHT_ENCODER)
 
-    if (prev_right_state is not None and current_state != prev_right_state):
+    if prev_right_state is None:
+        prev_right_state = current_state
+        return
+    if current_state == prev_right_state:
+        return
+    if now - last_right_edge < ENC_DEBOUNCE_S:
         with count_lock:
-            right_count += 1
-        prev_right_state = current_state
-    elif prev_right_state is None:
-        prev_right_state = current_state
+            right_rejected += 1
+        return
+    with count_lock:
+        right_count += 1
+    prev_right_state = current_state
+    last_right_edge = now
 
 
 def reset_encoder():
-    global left_count, right_count
+    global left_count, right_count, left_rejected, right_rejected
     with count_lock:
         left_count, right_count = 0, 0
+        left_rejected, right_rejected = 0, 0
 
 
 def read_counts():
     """[FIX 1] Consistent snapshot of both counters."""
     with count_lock:
         return left_count, right_count
+
+
+def read_rejected():
+    """[FIX 4] Noise edges rejected since the last reset."""
+    with count_lock:
+        return left_rejected, right_rejected
 
 
 def set_motors(left, right):
@@ -250,7 +300,9 @@ def pid_control():
             target_right_pwm = right_pwm
         else:
             lc, rc = read_counts()
-            error = lc - rc
+            # [NEW] RIGHT_RATIO = 1.0 equalises counts (original); another value
+            # equalises wheel DISTANCE when the wheels are slightly different.
+            error = lc - rc * RIGHT_RATIO
             proportional = KP * error
             integral += KI * error * dt
             integral = max(-MAX_CORRECTION, min(integral, MAX_CORRECTION))  # Anti-windup
@@ -385,6 +437,12 @@ def stop_and_read_counts():
     return read_counts()
 
 
+def noise_note():
+    """[FIX 4] Text for the move log, only when noise edges were rejected."""
+    lr, rr = read_rejected()
+    return f" | noise edges rejected L/R: ({lr}, {rr})" if (lr or rr) else ""
+
+
 def wheel_server():
     global left_pwm, right_pwm, running
 
@@ -438,7 +496,7 @@ def wheel_server():
 
                         elapsed = monotonic() - autonomous_start_time
                         counts = stop_and_read_counts()
-                        print(f"Timed movement completed after {elapsed:.3f}s, L/R enc: {counts}")
+                        print(f"Timed movement completed after {elapsed:.3f}s, L/R enc: {counts}{noise_note()}")
 
                     elif move_mode == 2:
                         data = recv_exact(client_socket, 16)
@@ -462,7 +520,7 @@ def wheel_server():
                             time.sleep(TIMING_POLL)
 
                         counts = stop_and_read_counts()
-                        print(f"Encoder-based movement completed, L/R enc: {counts}")
+                        print(f"Encoder-based movement completed, L/R enc: {counts}{noise_note()}")
 
                     else:
                         print(f"Unknown move mode {move_mode}")
@@ -523,9 +581,17 @@ if __name__ == "__main__":
                         help="start kick duration in s (original 0.05, 0 = off)")
     parser.add_argument('--stop_settle', type=float, default=0.12,
                         help="wait after braking before reporting counts (s)")
+    parser.add_argument('--debounce_ms', type=float, default=3.0,
+                        help="reject encoder edges closer than this (ms); 0 = off")
+    parser.add_argument('--right_ratio', type=float, default=1.0,
+                        help="PID wheel-size compensation: LEFT_COUNTS_PER_M / RIGHT_COUNTS_PER_M "
+                             "(1.0 = original)")
     args = parser.parse_args()
     KICK_PWM = args.kick_pwm
     KICK_TIME = args.kick_time
     STOP_SETTLE_TIME = args.stop_settle
-    print(f"Start kick: {KICK_PWM:.0f}% for {KICK_TIME:.3f}s | stop settle {STOP_SETTLE_TIME:.2f}s")
+    ENC_DEBOUNCE_S = max(0.0, args.debounce_ms) / 1000.0
+    RIGHT_RATIO = args.right_ratio
+    print(f"Start kick: {KICK_PWM:.0f}% for {KICK_TIME:.3f}s | stop settle {STOP_SETTLE_TIME:.2f}s | "
+          f"encoder debounce {ENC_DEBOUNCE_S * 1000:.1f} ms | PID right_ratio {RIGHT_RATIO:.4f}")
     main()
