@@ -28,6 +28,16 @@ Changes compared with the original lab version (search for [FIX] / [NEW]):
               python listen.py --debounce_ms 3      (default)
               python listen.py --debounce_ms 0      (off = old behaviour)
 
+  [FIX 5] Soft stop for encoder-target moves (mode 2).
+          Calibration showed that stopping from full speed with the hard brake
+          makes the robot SKID: ~1 cm further than the encoders count and a
+          ~1-1.5 deg turn to the left at EVERY stop.  Now, once the robot is
+          moving and is within --decel_counts of the target, the wheel power is
+          reduced to --decel_pwm, so it arrives slowly and stops without skid.
+          This also reduces the overshoot.
+              python listen.py --decel_counts 8 --decel_pwm 25   (default)
+              python listen.py --decel_counts 0                   (off = old behaviour)
+
   [NEW]   Start "kick" (80% power for 0.05 s at every start) is adjustable:
               python listen.py --kick_pwm 80 --kick_time 0.05   (default = original)
               python listen.py --kick_time 0                     (no kick)
@@ -39,7 +49,7 @@ Changes compared with the original lab version (search for [FIX] / [NEW]):
           (from wheel_calibration_encoder.py fit) to equalise DISTANCE instead.
           Default 1.0 = original behaviour.
 
-  If you change kick, debounce or right_ratio, redo the calibration.
+  If you change kick, debounce, decel or right_ratio, redo the calibration.
 
 Everything else (protocol, ports, PID, pins) is unchanged, so the PC-side
 botconnect.py works exactly as before.
@@ -96,6 +106,10 @@ left_rejected, right_rejected = 0, 0   # noise edges rejected since the last res
 
 # [NEW] PID wheel-size compensation (set from command line in __main__)
 RIGHT_RATIO = 1.0
+
+# [FIX 5] Soft stop for mode 2 (set from command line in __main__)
+DECEL_COUNTS = 8     # start slowing when this many counts (average) remain
+DECEL_PWM = 25.0     # % power for the slow final approach (must keep the robot moving)
 
 # [FIX 1] Counter access is shared by 3 threads (encoder callbacks, PID, server)
 count_lock = threading.Lock()
@@ -508,12 +522,25 @@ def wheel_server():
 
                         reset_encoder()  # [FIX 3] start from zero, not stale counts
                         autonomous_start_time = monotonic()
-                        left_pwm, right_pwm = left_speed * 100, right_speed * 100
+                        fast_left, fast_right = left_speed * 100, right_speed * 100
+                        left_pwm, right_pwm = fast_left, fast_right
+                        slowed = False
 
                         while running:
                             lc, rc = read_counts()
                             if lc >= target_left_enc and rc >= target_right_enc:
                                 break
+                            # [FIX 5] Slow down for the last few counts. Only once
+                            # the wheels are already turning (lc + rc >= 2), so a
+                            # short move still STARTS at full power and cannot stall.
+                            if DECEL_COUNTS > 0 and not slowed and lc + rc >= 2:
+                                remaining = 0.5 * ((target_left_enc - lc) + (target_right_enc - rc))
+                                if remaining <= DECEL_COUNTS:
+                                    biggest = max(abs(fast_left), abs(fast_right))
+                                    if biggest > DECEL_PWM:
+                                        k = DECEL_PWM / biggest
+                                        left_pwm, right_pwm = fast_left * k, fast_right * k
+                                    slowed = True
                             if monotonic() - autonomous_start_time >= 8:  # safety after 8s
                                 print("Encoder-based movement failed (timeout).")
                                 break
@@ -583,6 +610,10 @@ if __name__ == "__main__":
                         help="wait after braking before reporting counts (s)")
     parser.add_argument('--debounce_ms', type=float, default=3.0,
                         help="reject encoder edges closer than this (ms); 0 = off")
+    parser.add_argument('--decel_counts', type=float, default=8.0,
+                        help="mode 2: slow down when this many counts remain (0 = off)")
+    parser.add_argument('--decel_pwm', type=float, default=25.0,
+                        help="mode 2: power (%%) for the slow final approach")
     parser.add_argument('--right_ratio', type=float, default=1.0,
                         help="PID wheel-size compensation: LEFT_COUNTS_PER_M / RIGHT_COUNTS_PER_M "
                              "(1.0 = original)")
@@ -592,6 +623,9 @@ if __name__ == "__main__":
     STOP_SETTLE_TIME = args.stop_settle
     ENC_DEBOUNCE_S = max(0.0, args.debounce_ms) / 1000.0
     RIGHT_RATIO = args.right_ratio
+    DECEL_COUNTS = max(0.0, args.decel_counts)
+    DECEL_PWM = max(float(MIN_PWM_THRESHOLD), args.decel_pwm)
     print(f"Start kick: {KICK_PWM:.0f}% for {KICK_TIME:.3f}s | stop settle {STOP_SETTLE_TIME:.2f}s | "
-          f"encoder debounce {ENC_DEBOUNCE_S * 1000:.1f} ms | PID right_ratio {RIGHT_RATIO:.4f}")
+          f"encoder debounce {ENC_DEBOUNCE_S * 1000:.1f} ms | PID right_ratio {RIGHT_RATIO:.4f} | "
+          f"soft stop: last {DECEL_COUNTS:.0f} counts at {DECEL_PWM:.0f}%")
     main()
