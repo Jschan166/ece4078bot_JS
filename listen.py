@@ -38,6 +38,15 @@ Changes compared with the original lab version (search for [FIX] / [NEW]):
               python listen.py --decel_counts 8 --decel_pwm 25   (default)
               python listen.py --decel_counts 0                   (off = old behaviour)
 
+  [FIX 6] Soft stop for TURNS + anti-stall.
+          Turning on the spot needs more power than driving straight (the
+          casters have to scrub sideways), so 25% made some turns STALL just
+          before the target; the move then sat still until the 8 s timeout.
+          Now turns slow down to --decel_pwm_turn (default 32%) instead, and if
+          the wheels stop counting for --stall_ms (default 150 ms) during the
+          slow phase, full power is restored so the move always finishes.
+          Every rescue is printed ("anti-stall") on the Pi.
+
   [NEW]   Start "kick" (80% power for 0.05 s at every start) is adjustable:
               python listen.py --kick_pwm 80 --kick_time 0.05   (default = original)
               python listen.py --kick_time 0                     (no kick)
@@ -110,6 +119,8 @@ RIGHT_RATIO = 1.0
 # [FIX 5] Soft stop for mode 2 (set from command line in __main__)
 DECEL_COUNTS = 8     # start slowing when this many counts (average) remain
 DECEL_PWM = 25.0     # % power for the slow final approach (must keep the robot moving)
+DECEL_PWM_TURN = 32.0  # [FIX 6] slow-approach power for on-the-spot turns
+STALL_S = 0.15         # [FIX 6] no new counts for this long while slowed -> full power again
 
 # [FIX 1] Counter access is shared by 3 threads (encoder callbacks, PID, server)
 count_lock = threading.Lock()
@@ -525,11 +536,18 @@ def wheel_server():
                         fast_left, fast_right = left_speed * 100, right_speed * 100
                         left_pwm, right_pwm = fast_left, fast_right
                         slowed = False
+                        # [FIX 6] turns (wheels in opposite directions) need more power
+                        turning = (fast_left > 0) != (fast_right > 0)
+                        decel_pwm = DECEL_PWM_TURN if turning else DECEL_PWM
+                        last_total, last_change, stall_rescues = 0, monotonic(), 0
 
                         while running:
                             lc, rc = read_counts()
                             if lc >= target_left_enc and rc >= target_right_enc:
                                 break
+                            now = monotonic()
+                            if lc + rc != last_total:
+                                last_total, last_change = lc + rc, now
                             # [FIX 5] Slow down for the last few counts. Only once
                             # the wheels are already turning (lc + rc >= 2), so a
                             # short move still STARTS at full power and cannot stall.
@@ -537,17 +555,26 @@ def wheel_server():
                                 remaining = 0.5 * ((target_left_enc - lc) + (target_right_enc - rc))
                                 if remaining <= DECEL_COUNTS:
                                     biggest = max(abs(fast_left), abs(fast_right))
-                                    if biggest > DECEL_PWM:
-                                        k = DECEL_PWM / biggest
+                                    if biggest > decel_pwm:
+                                        k = decel_pwm / biggest
                                         left_pwm, right_pwm = fast_left * k, fast_right * k
                                     slowed = True
+                                    last_change = now
+                            # [FIX 6] Anti-stall: slowed and nothing counted for a
+                            # while -> back to full power to finish the move.
+                            if slowed and now - last_change > STALL_S and \
+                                    (left_pwm, right_pwm) != (fast_left, fast_right):
+                                left_pwm, right_pwm = fast_left, fast_right
+                                stall_rescues += 1
+                                last_change = now
                             if monotonic() - autonomous_start_time >= 8:  # safety after 8s
                                 print("Encoder-based movement failed (timeout).")
                                 break
                             time.sleep(TIMING_POLL)
 
                         counts = stop_and_read_counts()
-                        print(f"Encoder-based movement completed, L/R enc: {counts}{noise_note()}")
+                        rescue = f" | anti-stall x{stall_rescues}" if stall_rescues else ""
+                        print(f"Encoder-based movement completed, L/R enc: {counts}{noise_note()}{rescue}")
 
                     else:
                         print(f"Unknown move mode {move_mode}")
@@ -614,6 +641,10 @@ if __name__ == "__main__":
                         help="mode 2: slow down when this many counts remain (0 = off)")
     parser.add_argument('--decel_pwm', type=float, default=25.0,
                         help="mode 2: power (%%) for the slow final approach")
+    parser.add_argument('--decel_pwm_turn', type=float, default=32.0,
+                        help="mode 2: slow-approach power (%%) for on-the-spot turns")
+    parser.add_argument('--stall_ms', type=float, default=150.0,
+                        help="mode 2: restore full power if no counts for this long while slowed")
     parser.add_argument('--right_ratio', type=float, default=1.0,
                         help="PID wheel-size compensation: LEFT_COUNTS_PER_M / RIGHT_COUNTS_PER_M "
                              "(1.0 = original)")
@@ -625,7 +656,10 @@ if __name__ == "__main__":
     RIGHT_RATIO = args.right_ratio
     DECEL_COUNTS = max(0.0, args.decel_counts)
     DECEL_PWM = max(float(MIN_PWM_THRESHOLD), args.decel_pwm)
+    DECEL_PWM_TURN = max(float(MIN_PWM_THRESHOLD), args.decel_pwm_turn)
+    STALL_S = max(0.02, args.stall_ms / 1000.0)
     print(f"Start kick: {KICK_PWM:.0f}% for {KICK_TIME:.3f}s | stop settle {STOP_SETTLE_TIME:.2f}s | "
           f"encoder debounce {ENC_DEBOUNCE_S * 1000:.1f} ms | PID right_ratio {RIGHT_RATIO:.4f} | "
-          f"soft stop: last {DECEL_COUNTS:.0f} counts at {DECEL_PWM:.0f}%")
+          f"soft stop: last {DECEL_COUNTS:.0f} counts at {DECEL_PWM:.0f}% (turns {DECEL_PWM_TURN:.0f}%), "
+          f"anti-stall {STALL_S * 1000:.0f} ms")
     main()
