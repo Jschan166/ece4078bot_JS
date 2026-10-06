@@ -115,6 +115,12 @@ left_rejected, right_rejected = 0, 0   # noise edges rejected since the last res
 
 # [NEW] PID wheel-size compensation (set from command line in __main__)
 RIGHT_RATIO = 1.0
+# [FIX 7] Straight-step trim.  In mode 2 with DIFFERENT left/right targets on a
+# straight move, the PID keeps the right wheel (left - right) counts behind/ahead,
+# growing smoothly from 0 to the full difference over the move.  Before this the
+# PID always forced equal counts, so per-wheel targets from operate.py had no effect.
+PID_OFFSET = 0.0          # wanted (left - right) counts at the END of the move
+PID_OFFSET_SPAN = 1.0     # left counts over which the offset ramps in
 
 # [FIX 5] Soft stop for mode 2 (set from command line in __main__)
 DECEL_COUNTS = 8     # start slowing when this many counts (average) remain
@@ -288,6 +294,7 @@ def apply_min_threshold(pwm_value, min_threshold):
 def pid_control():
     '''This function sets the motor pwm using pid control'''
     global left_pwm, right_pwm, use_PID, KP, KI, KD, prev_movement, current_movement
+    global PID_OFFSET, PID_OFFSET_SPAN
 
     integral = 0
     last_error = 0
@@ -327,7 +334,9 @@ def pid_control():
             lc, rc = read_counts()
             # [NEW] RIGHT_RATIO = 1.0 equalises counts (original); another value
             # equalises wheel DISTANCE when the wheels are slightly different.
-            error = lc - rc * RIGHT_RATIO
+            # [FIX 7] ramped offset: 0 at the start, PID_OFFSET at the target
+            offset_now = PID_OFFSET * min(1.0, lc / max(1.0, PID_OFFSET_SPAN))
+            error = lc - rc * RIGHT_RATIO - offset_now
             proportional = KP * error
             integral += KI * error * dt
             integral = max(-MAX_CORRECTION, min(integral, MAX_CORRECTION))  # Anti-windup
@@ -470,6 +479,7 @@ def noise_note():
 
 def wheel_server():
     global left_pwm, right_pwm, running
+    global PID_OFFSET, PID_OFFSET_SPAN
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -540,6 +550,13 @@ def wheel_server():
                         turning = (fast_left > 0) != (fast_right > 0)
                         decel_pwm = DECEL_PWM_TURN if turning else DECEL_PWM
                         last_total, last_change, stall_rescues = 0, monotonic(), 0
+                        # [FIX 7] per-wheel targets on a straight move -> PID offset
+                        if not turning and target_left_enc != target_right_enc:
+                            PID_OFFSET_SPAN = float(max(1, target_left_enc))
+                            PID_OFFSET = float(target_left_enc - target_right_enc)
+                            print(f"   straight trim: right wheel {-PID_OFFSET:+.0f} counts vs left")
+                        else:
+                            PID_OFFSET, PID_OFFSET_SPAN = 0.0, 1.0
 
                         while running:
                             lc, rc = read_counts()
@@ -573,6 +590,7 @@ def wheel_server():
                             time.sleep(TIMING_POLL)
 
                         counts = stop_and_read_counts()
+                        PID_OFFSET, PID_OFFSET_SPAN = 0.0, 1.0      # [FIX 7] back to equal counts
                         rescue = f" | anti-stall x{stall_rescues}" if stall_rescues else ""
                         print(f"Encoder-based movement completed, L/R enc: {counts}{noise_note()}{rescue}")
 
